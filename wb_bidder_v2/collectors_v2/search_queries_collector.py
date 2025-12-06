@@ -42,58 +42,29 @@ class SearchQueriesCollectorV2(BaseCollectorV2):
         queries: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Нормализует search-report (analytics v2) в плоские строки:
-        date, nmId, query, impressions/views, clicks, orders, spend, revenue.
-
-        CombinedAnalyzerV2 дальше сам досчитает CTR/CPC/CPO/ROAS.
+        Возвращает плоские строки поиска для CombinedAnalyzerV2 в формате:
+        {
+            "nmId": int,
+            "query": str,
+            "shows": int,
+            "impressions": int,
+            "views": int,
+            "clicks": int,
+            "orders": int,
+            "ctr": float,
+            "avg_position": float | None,
+        }
         """
         raw = self.load_raw_payload()
+        payload = self._extract_payload(raw)
 
-        rows: List[Dict[str, Any]] = []
-
-        # Основной путь: новый формат analytics v2 (data -> groups -> items)
-        try:
-            payload = raw.get("data") if isinstance(raw, dict) else None
-            if isinstance(payload, dict):
-                groups = payload.get("groups")
-                if isinstance(groups, list):
-                    for group in groups:
-                        if not isinstance(group, dict):
-                            continue
-                        query_text = (
-                            group.get("query")
-                            or group.get("word")
-                            or group.get("searchQuery")
-                        )
-                        items = group.get("items")
-                        if not isinstance(items, list):
-                            continue
-                        for card in items:
-                            if not isinstance(card, dict):
-                                continue
-                            normalized = self._normalize_card_entry(card)
-                            if not normalized:
-                                continue
-                            if query_text:
-                                normalized["query"] = query_text
-                            rows.append(normalized)
-        except Exception:
-            logger.exception(
-                "SearchQueriesCollectorV2: failed to parse groups/items search-report format"
-            )
-
-        # Фоллбек: общий нормалайзер (legacy форматы / старые RAW)
+        rows: List[Dict[str, Any]] = self._normalize_groups(payload)
         if not rows:
-            rows = self._ensure_rows(raw)
+            rows = self._ensure_rows(payload)
 
-        # Опциональный фильтр по nmId (для panel_cli / CombinedAnalyzerV2)
         if nm_ids:
             nm_set = {int(nm) for nm in nm_ids}
-
-            def _nm_id(row: Dict[str, Any]) -> int:
-                return int(row.get("nmId") or row.get("nm_id") or 0)
-
-            rows = [row for row in rows if _nm_id(row) in nm_set]
+            rows = [row for row in rows if int(row.get("nmId") or 0) in nm_set]
 
         return rows
 
@@ -103,6 +74,51 @@ class SearchQueriesCollectorV2(BaseCollectorV2):
             return int(value)
         except (TypeError, ValueError):
             return 0
+
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _extract_payload(raw: Any) -> Any:
+        if isinstance(raw, dict) and "wb_raw" in raw:
+            return raw["wb_raw"]
+        return raw
+
+    @classmethod
+    def _normalize_groups(cls, payload: Any) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        if not isinstance(payload, dict):
+            return rows
+
+        data_block = payload.get("data")
+        if not isinstance(data_block, dict):
+            return rows
+
+        groups = data_block.get("groups")
+        if not isinstance(groups, list):
+            return rows
+
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            query_text = group.get("query") or group.get("word") or group.get("searchQuery")
+            items = group.get("items")
+            if not isinstance(items, list):
+                continue
+            for card in items:
+                if not isinstance(card, dict):
+                    continue
+                normalized = cls._normalize_card_entry(card, query_text)
+                if normalized:
+                    rows.append(normalized)
+
+        return rows
 
     @classmethod
     def _normalize_row(cls, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -124,110 +140,88 @@ class SearchQueriesCollectorV2(BaseCollectorV2):
         if not query_text:
             return None
 
-        shows = cls._safe_int(row.get("impressions") or row.get("views") or row.get("shows"))
+        shows = cls._safe_int(row.get("shows") or row.get("impressions") or row.get("views"))
         clicks = cls._safe_int(row.get("clicks"))
         orders = cls._safe_int(row.get("orders") or row.get("purchases"))
+        avg_position = row.get("avg_position") or row.get("rank") or row.get("position")
+        avg_position_float = cls._safe_float(avg_position)
+        if avg_position_float is not None and avg_position_float <= 0:
+            avg_position_float = None
         ctr = (clicks / shows * 100.0) if shows > 0 else 0.0
-        rank = row.get("rank") or row.get("avg_position") or row.get("position")
 
         return {
-            "date": row.get("date") or row.get("currentDate") or "",
             "nmId": int(nm_value),
             "query": query_text,
             "shows": shows,
+            "impressions": shows,
+            "views": shows,
             "clicks": clicks,
             "orders": orders,
             "ctr": ctr,
-            "rank": cls._safe_int(rank) if rank is not None else None,
+            "avg_position": avg_position_float,
         }
 
     @classmethod
-    def _normalize_card_entry(cls, card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _normalize_card_entry(cls, card: Dict[str, Any], query: Optional[str]) -> Optional[Dict[str, Any]]:
         nm_id = cls._safe_int(card.get("nmId") or card.get("nm_id"))
         if nm_id <= 0:
             return None
 
-        open_card = card.get("openCard") or {}
-        add_to_cart = card.get("addToCart") or {}
-        orders_block = card.get("orders") or {}
-        avg_position = card.get("avgPosition") or {}
+        if not query:
+            query = "<unknown>"
 
-        shows = cls._safe_int(open_card.get("current"))
-        clicks = cls._safe_int(add_to_cart.get("current"))
-        orders = cls._safe_int(orders_block.get("current"))
-        rank = cls._safe_int(avg_position.get("current"))
+        metrics_block = card.get("metrics") if isinstance(card.get("metrics"), dict) else None
+
+        shows = cls._metric_current(metrics_block, card, "openCard")
+        clicks = cls._metric_current(metrics_block, card, "addToCart")
+        orders = cls._metric_current(metrics_block, card, "orders")
+        avg_position = cls._metric_current(metrics_block, card, "avgPosition", as_float=True)
+
         ctr = (clicks / shows * 100.0) if shows > 0 else 0.0
+        avg_position_value = avg_position if (avg_position is not None and avg_position > 0) else None
 
         return {
-            "date": None,
             "nmId": nm_id,
-            "query": None,
+            "query": query,
             "shows": shows,
-            "views": shows,
             "impressions": shows,
+            "views": shows,
             "clicks": clicks,
             "orders": orders,
-            "revenue": 0.0,
-            "cost": 0.0,
-            "spend": 0.0,
             "ctr": ctr,
-            "rank": rank if rank > 0 else None,
+            "avg_position": avg_position_value,
         }
 
     @classmethod
-    def _ensure_rows(cls, raw: Any) -> List[Dict[str, Any]]:
-        payload = raw
-        if isinstance(raw, dict) and "wb_raw" in raw:
-            payload = raw["wb_raw"]
+    def _metric_current(
+        cls,
+        metrics_block: Optional[Dict[str, Any]],
+        card: Dict[str, Any],
+        field: str,
+        *,
+        as_float: bool = False,
+    ) -> int | float:
+        def _extract(block: Any) -> Any:
+            if isinstance(block, dict):
+                if "current" in block:
+                    return block.get("current")
+                return block.get("value")
+            return block
 
-        normalized_new: List[Dict[str, Any]] = []
-        data_block = None
+        primary = _extract(metrics_block.get(field)) if metrics_block else None
+        fallback = _extract(card.get(field))
+        value = primary if primary is not None else fallback
+
+        if as_float:
+            result = cls._safe_float(value)
+            return result if result is not None else 0.0
+
+        return cls._safe_int(value)
+
+    @classmethod
+    def _ensure_rows(cls, payload: Any) -> List[Dict[str, Any]]:
         if isinstance(payload, dict):
-            data_block = payload.get("data")
-
-        # Новый формат: data (dict) -> groups -> items
-        if isinstance(data_block, dict):
-            groups = data_block.get("groups")
-            if isinstance(groups, list):
-                for group in groups:
-                    if not isinstance(group, dict):
-                        continue
-                    query_text = group.get("query") or group.get("keyword")
-                    items = group.get("items")
-                    if not isinstance(items, list):
-                        continue
-                    for card in items:
-                        if not isinstance(card, dict):
-                            continue
-                        normalized_card = cls._normalize_card_entry(card)
-                        if not normalized_card:
-                            continue
-                        if query_text:
-                            normalized_card["query"] = query_text
-                        normalized_new.append(normalized_card)
-        # Альтернативный формат: data (list) -> block.response.cards
-        if not normalized_new and isinstance(data_block, list):
-            for block in data_block:
-                if not isinstance(block, dict):
-                    continue
-                response = block.get("response")
-                if not isinstance(response, dict):
-                    continue
-                cards = response.get("cards")
-                if not isinstance(cards, list):
-                    continue
-                for card in cards:
-                    if not isinstance(card, dict):
-                        continue
-                    normalized_card = cls._normalize_card_entry(card)
-                    if normalized_card:
-                        normalized_new.append(normalized_card)
-        if normalized_new:
-            return normalized_new
-
-        # Legacy fallback
-        if isinstance(payload, dict):
-            items = payload.get("data") or payload.get("items") or payload.get("rows")
+            items = payload.get("rows") or payload.get("items") or payload.get("data")
             rows = items if isinstance(items, list) else []
         elif isinstance(payload, list):
             rows = payload
@@ -243,4 +237,10 @@ class SearchQueriesCollectorV2(BaseCollectorV2):
                 normalized.append(normalized_row)
 
         return normalized
+
+    def collect(self, days: int) -> List[Dict[str, Any]]:
+        today = datetime.date.today()
+        date_to = today
+        date_from = today - datetime.timedelta(days=days)
+        return self.fetch_search_queries(date_from, date_to)
 
